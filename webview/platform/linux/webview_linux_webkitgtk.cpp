@@ -807,6 +807,10 @@ bool Instance::create(Config config) {
 				[[maybe_unused]] static const auto Inited = [&] {
 					switch (_glBackend) {
 					case Ui::GL::Backend::Raster:
+					case Ui::GL::Backend::QRhi:
+						// QRhi may resolve to a Vulkan scene graph: a
+						// QQuickWidget reparent then deadlocks in Qt
+						// destroying its transient QWaylandVulkanWindow.
 						SetGraphicsApi(QSGRendererInterface::Software);
 						break;
 					case Ui::GL::Backend::OpenGL:
@@ -2823,10 +2827,18 @@ void Instance::registerMasterMethodHandlers() {
 				}
 
 				const auto qtAppId = QGuiApplication::desktopFileName()
+					+ u".miniapp"_q;
+				const auto stdAppId = qtAppId.toStdString();
+
+				if (Gio::Application::id_is_valid(stdAppId)) {
+					return stdAppId;
+				}
+
+				const auto baseAppId = QGuiApplication::desktopFileName()
 					.toStdString();
 
-				if (Gio::Application::id_is_valid(qtAppId)) {
-					return qtAppId;
+				if (Gio::Application::id_is_valid(baseAppId)) {
+					return baseAppId;
 				}
 
 				return std::string();
