@@ -2626,15 +2626,16 @@ void Instance::startProcess() {
 		Gio::SubprocessFlags::NONE_);
 
 	if (_platform == Platform::Wayland
-			&& _mode != WindowMode::External
-			&& _glBackend == Ui::GL::Backend::Raster) {
+			&& (_mode == WindowMode::External
+				|| _glBackend == Ui::GL::Backend::Raster)) {
 		serviceLauncher.setenv("LIBGL_ALWAYS_SOFTWARE", "1", true);
 		serviceLauncher.setenv("GSK_RENDERER", "cairo", true);
 		serviceLauncher.setenv("GDK_DISABLE", "gl", true);
 		serviceLauncher.setenv("GDK_DEBUG", "gl-disable", true);
 		serviceLauncher.setenv("GDK_GL", "disable", true);
 		serviceLauncher.setenv("WEBKIT_DISABLE_COMPOSITING_MODE", "1", true);
-	} else if (_platform == Platform::Any || _mode == WindowMode::External) {
+	}
+	if (_platform == Platform::Any || _mode == WindowMode::External) {
 		const auto token = ::base::Platform::XdgActivationToken().toStdString();
 		if (!token.empty()) {
 			serviceLauncher.setenv("XDG_ACTIVATION_TOKEN", token, true);
@@ -3073,6 +3074,9 @@ int Instance::exec() {
 				if (const auto appId = std::get<4>(*settings)
 						; !appId.empty()) {
 					app.set_application_id(appId);
+					// GTK3 derives the Wayland app_id of the helper window
+					// from g_get_prgname(), not from the GApplication id.
+					GLib::set_prgname(appId);
 				}
 				loop.quit();
 			});
