@@ -129,14 +129,20 @@ using TaskPointer = id<WKURLSchemeTask>;
 	return nil;
 }
 
-// The private WKPreferences keys reach -[WKPreferences _setPeerConnectionEnabled:]
-// and _setMediaDevicesEnabled: (WKPreferencesPrivate, macOS 10.13.4+) through
-// KVC's _set<Key>: lookup, exactly like developerExtrasEnabled above; the JS
-// lock script stays as the fallback if a future OS drops the keys. Lockdown
-// mode (public API, macOS 13+) additionally disables JIT, WebAssembly, WebGL
-// and a long list of legacy engine features for the whole page.
+// The private WKPreferences keys reach -[WKPreferences _setPeerConnectionEnabled:],
+// _setMediaDevicesEnabled: (WKPreferencesPrivate, macOS 10.13.4+) and
+// _setAllowsPictureInPictureMediaPlayback: through KVC's _set<Key>: lookup,
+// exactly like developerExtrasEnabled above; the JS lock script stays as the
+// fallback for the media keys if a future OS drops them. Picture-in-picture is
+// the one media presentation a windowless WKWebView could still surface on
+// screen, since element fullscreen stays off by default. Lockdown mode
+// (public API, macOS 13+) additionally disables JIT, WebAssembly, WebGL and
+// a long list of legacy engine features for the whole page.
 void DisableRestrictedEngineFeatures(WKWebViewConfiguration *configuration) {
-	for (NSString *key in @[@"peerConnectionEnabled", @"mediaDevicesEnabled"]) {
+	for (NSString *key in @[
+			@"peerConnectionEnabled",
+			@"mediaDevicesEnabled",
+			@"allowsPictureInPictureMediaPlayback"]) {
 		@try {
 			[configuration.preferences setValue:@NO forKey:key];
 		} @catch (NSException *exception) {
@@ -226,10 +232,11 @@ void DisableClipboardReading(WKPreferences *preferences) {
 @interface Handler : NSObject<WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate, WKURLSchemeHandler> {
 }
 
-- (id) initWithMessageHandler:(std::function<void(Webview::Message)>)messageHandler navigationStartHandler:(std::function<bool(std::string,bool)>)navigationStartHandler navigationDoneHandler:(std::function<void(bool)>)navigationDoneHandler dialogHandler:(std::function<Webview::DialogResult(Webview::DialogArgs)>)dialogHandler dataRequested:(std::function<void(id<WKURLSchemeTask>,bool)>)dataRequested updateStates:(std::function<void()>)updateStates dataDomain:(std::string)dataDomain dataRequestRedirectHost:(std::string)dataRequestRedirectHost restricted:(BOOL)restricted;
+- (id) initWithMessageHandler:(std::function<void(Webview::Message)>)messageHandler navigationPolicyHandler:(std::function<bool(std::string,bool)>)navigationPolicyHandler navigationStartHandler:(std::function<void()>)navigationStartHandler navigationDoneHandler:(std::function<void(bool)>)navigationDoneHandler dialogHandler:(std::function<Webview::DialogResult(Webview::DialogArgs)>)dialogHandler dataRequested:(std::function<void(id<WKURLSchemeTask>,bool)>)dataRequested updateStates:(std::function<void()>)updateStates dataDomain:(std::string)dataDomain dataRequestRedirectHost:(std::string)dataRequestRedirectHost restricted:(BOOL)restricted;
 - (void) userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message;
 - (void) webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler;
 - (void) observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary<NSKeyValueChangeKey,id> *)change context:(void *)context;
+- (void) webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation;
 - (void) webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation;
 - (void) webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error;
 - (void) navigationDone:(BOOL)success;
@@ -258,7 +265,8 @@ void DisableClipboardReading(WKPreferences *preferences) {
 
 @implementation Handler {
 	std::function<void(Webview::Message)> _messageHandler;
-	std::function<bool(std::string,bool)> _navigationStartHandler;
+	std::function<bool(std::string,bool)> _navigationPolicyHandler;
+	std::function<void()> _navigationStartHandler;
 	std::function<void(bool)> _navigationDoneHandler;
 	std::function<Webview::DialogResult(Webview::DialogArgs)> _dialogHandler;
 	std::function<void(id<WKURLSchemeTask> task, bool started)> _dataRequested;
@@ -272,9 +280,10 @@ void DisableClipboardReading(WKPreferences *preferences) {
 	BOOL _restricted;
 }
 
-- (id) initWithMessageHandler:(std::function<void(Webview::Message)>)messageHandler navigationStartHandler:(std::function<bool(std::string,bool)>)navigationStartHandler navigationDoneHandler:(std::function<void(bool)>)navigationDoneHandler dialogHandler:(std::function<Webview::DialogResult(Webview::DialogArgs)>)dialogHandler dataRequested:(std::function<void(id<WKURLSchemeTask>,bool)>)dataRequested updateStates:(std::function<void()>)updateStates dataDomain:(std::string)dataDomain dataRequestRedirectHost:(std::string)dataRequestRedirectHost restricted:(BOOL)restricted {
+- (id) initWithMessageHandler:(std::function<void(Webview::Message)>)messageHandler navigationPolicyHandler:(std::function<bool(std::string,bool)>)navigationPolicyHandler navigationStartHandler:(std::function<void()>)navigationStartHandler navigationDoneHandler:(std::function<void(bool)>)navigationDoneHandler dialogHandler:(std::function<Webview::DialogResult(Webview::DialogArgs)>)dialogHandler dataRequested:(std::function<void(id<WKURLSchemeTask>,bool)>)dataRequested updateStates:(std::function<void()>)updateStates dataDomain:(std::string)dataDomain dataRequestRedirectHost:(std::string)dataRequestRedirectHost restricted:(BOOL)restricted {
 	if (self = [super init]) {
 		_messageHandler = std::move(messageHandler);
+		_navigationPolicyHandler = std::move(navigationPolicyHandler);
 		_navigationStartHandler = std::move(navigationStartHandler);
 		_navigationDoneHandler = std::move(navigationDoneHandler);
 		_dialogHandler = std::move(dialogHandler);
@@ -328,15 +337,15 @@ void DisableClipboardReading(WKPreferences *preferences) {
 		return;
 	}
 	if (newWindow) {
-		if (_navigationStartHandler && _navigationStartHandler(url, true)) {
+		if (_navigationPolicyHandler && _navigationPolicyHandler(url, true)) {
 			QDesktopServices::openUrl(QString::fromUtf8(url));
 		}
 		decisionHandler(WKNavigationActionPolicyCancel);
 	} else {
 		if ([target isMainFrame]
 			&& !std::string(url).starts_with(_dataDomain)
-			&& _navigationStartHandler
-			&& !_navigationStartHandler(url, false)) {
+			&& _navigationPolicyHandler
+			&& !_navigationPolicyHandler(url, false)) {
 			decisionHandler(WKNavigationActionPolicyCancel);
 		} else {
 			decisionHandler(WKNavigationActionPolicyAllow);
@@ -349,6 +358,12 @@ void DisableClipboardReading(WKPreferences *preferences) {
 		if (_updateStates) {
 			_updateStates();
 		}
+	}
+}
+
+- (void) webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation {
+	if (_navigationStartHandler) {
+		_navigationStartHandler();
 	}
 }
 
@@ -375,7 +390,7 @@ void DisableClipboardReading(WKPreferences *preferences) {
 	}
 	NSString *string = [[[navigationAction request] URL] absoluteString];
 	const auto url = [string UTF8String];
-	if (_navigationStartHandler && _navigationStartHandler(url, true)) {
+	if (_navigationPolicyHandler && _navigationPolicyHandler(url, true)) {
 		QDesktopServices::openUrl(QString::fromUtf8(url));
 	}
 	return nil;
@@ -803,7 +818,7 @@ Instance::Instance(Config config) {
 	const auto handler = restricted
 		? [RestrictedHandler alloc]
 		: [Handler alloc];
-	_handler = [handler initWithMessageHandler:config.messageHandler navigationStartHandler:config.navigationStartHandler navigationDoneHandler:config.navigationDoneHandler dialogHandler:config.dialogHandler dataRequested:handleDataRequest updateStates:updateStates dataDomain:_dataDomain dataRequestRedirectHost:std::move(config.dataRequestRedirectHost) restricted:restricted];
+	_handler = [handler initWithMessageHandler:config.messageHandler navigationPolicyHandler:config.navigationPolicyHandler navigationStartHandler:config.navigationStartHandler navigationDoneHandler:config.navigationDoneHandler dialogHandler:config.dialogHandler dataRequested:handleDataRequest updateStates:updateStates dataDomain:_dataDomain dataRequestRedirectHost:std::move(config.dataRequestRedirectHost) restricted:restricted];
 	_dataRequestHandler = std::move(config.dataRequestHandler);
 	[configuration setURLSchemeHandler:_handler forURLScheme:stdToNS(_dataProtocol)];
 	if (!restricted) {
